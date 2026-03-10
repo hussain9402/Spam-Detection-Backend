@@ -1,0 +1,10 @@
+
+.env
+
+# Firebase Credentials
+firebase-key.json
+
+
+# Python Cache
+__pycache__/
+
