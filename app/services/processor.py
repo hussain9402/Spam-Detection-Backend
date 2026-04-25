@@ -27,10 +27,14 @@ class MessageProcessor:
     
     def download_file(self, media_url, max_retries=3):
         """Download file from Firebase Storage URL with retries"""
+        if not media_url:
+            logger.error("No URL provided")
+            return None
+            
         for attempt in range(max_retries):
             try:
-                logger.debug(f"Downloading from {media_url} (attempt {attempt + 1})")
-                response = requests.get(media_url, timeout=30)
+                logger.debug(f"Downloading from URL (attempt {attempt + 1})")
+                response = requests.get(media_url, timeout=60)
                 
                 if response.status_code == 200:
                     logger.debug(f"Download successful: {len(response.content)} bytes")
@@ -45,9 +49,8 @@ class MessageProcessor:
             except Exception as e:
                 logger.error(f"Unexpected download error: {e}")
             
-            # Wait before retrying
             if attempt < max_retries - 1:
-                time.sleep(2 ** attempt)  # Exponential backoff
+                time.sleep(2 ** attempt)
         
         logger.error(f"Failed to download after {max_retries} attempts")
         return None
@@ -55,157 +58,211 @@ class MessageProcessor:
     def process_text_message(self, message_data):
         """Process a text message"""
         try:
-            text = message_data.get('text', '')
+            text = message_data.get('content', '') or message_data.get('text', '')
             if not text:
                 logger.warning(f"Empty text message: {message_data.get('id')}")
-                return None
+                return None, None  # 🔧 Return tuple (result, extracted_text)
             
             logger.debug(f"Processing text: {text[:50]}...")
             result = predict_spam(text)
             logger.info(f"Text prediction: {result}")
-            return result
+            return result, None  # 🔧 Return result and no extracted text (text is already in content)
             
         except Exception as e:
             logger.error(f"Error processing text message: {e}")
-            return None
+            return None, None
     
     def process_image_message(self, message_data):
         """Process an image message"""
         try:
-            media_url = message_data.get('media_url')
+            logger.info("🖼️ IMAGE MESSAGE DETECTED")
+            
+            # Look for URL in 'content' (Firebase)
+            media_url = message_data.get('content', '')
+            logger.info(f"📷 Image URL: {media_url[:100] if media_url else 'NOT FOUND'}...")
+            
             if not media_url:
                 logger.warning("No media URL found for image message")
-                return None
+                return None, None
             
-            # Download image
-            logger.info(f"Downloading image from {media_url}")
+            # Check if URL is from Firebase Storage
+            if 'firebasestorage' in media_url:
+                logger.info("✅ Firebase Storage URL detected")
+            else:
+                logger.warning("⚠️ URL is not from Firebase Storage")
+            
+            logger.info(f"Downloading image...")
             image_bytes = self.download_file(media_url)
             if not image_bytes:
                 logger.error("Failed to download image")
-                return None
+                return None, None
+            
+            logger.info(f"✅ Image downloaded: {len(image_bytes)} bytes")
             
             # Extract text using OCR
-            logger.info("Running OCR on image")
+            logger.info("Running OCR on image...")
             extracted_text = extract_text_from_image(image_bytes)
             
             if not extracted_text:
                 logger.warning("No text extracted from image")
-                return None
+                return None, None
             
-            logger.info(f"OCR extracted: {extracted_text[:100]}...")
-            
-            # Detect spam
+            logger.info(f"✅ OCR extracted: {extracted_text[:100]}...")
             result = predict_spam(extracted_text)
-            logger.info(f"Image spam prediction: {result}")
-            return result
+            logger.info(f"🎯 Image spam prediction: {result}")
+            
+            # 🔧 Return both result AND extracted text
+            return result, extracted_text
             
         except Exception as e:
             logger.error(f"Error processing image message: {e}")
-            return None
+            import traceback
+            logger.error(traceback.format_exc())
+            return None, None
     
     def process_audio_message(self, message_data):
-        """Process an audio message"""
+        """Process an audio/voice message"""
         try:
-            media_url = message_data.get('media_url')
+            logger.info("🎤 AUDIO/VOICE MESSAGE DETECTED")
+            
+            # Look for URL in 'content' (Firebase)
+            media_url = message_data.get('content', '')
+            logger.info(f"🎵 Audio URL: {media_url[:100] if media_url else 'NOT FOUND'}...")
+            
             if not media_url:
                 logger.warning("No media URL found for audio message")
-                return None
+                return None, None
             
-            # Download audio
-            logger.info(f"Downloading audio from {media_url}")
+            # Get duration if available
+            duration = message_data.get('duration', 'unknown')
+            logger.info(f"⏱️ Duration: {duration} seconds")
+            
+            logger.info(f"Downloading audio...")
             audio_bytes = self.download_file(media_url)
             if not audio_bytes:
                 logger.error("Failed to download audio")
-                return None
+                return None, None
+            
+            logger.info(f"✅ Audio downloaded: {len(audio_bytes)} bytes")
             
             # Convert speech to text
-            logger.info("Running speech-to-text on audio")
+            logger.info("Running speech-to-text on audio...")
             extracted_text = speech_to_text(audio_bytes)
             
             if not extracted_text:
                 logger.warning("No text extracted from audio")
-                return None
+                return None, None
             
-            logger.info(f"Transcribed: {extracted_text[:100]}...")
-            
-            # Detect spam
+            logger.info(f"✅ Transcribed: {extracted_text[:100]}...")
             result = predict_spam(extracted_text)
-            logger.info(f"Audio spam prediction: {result}")
-            return result
+            logger.info(f"🎯 Audio spam prediction: {result}")
+            
+            # 🔧 Return both result AND extracted text
+            return result, extracted_text
             
         except Exception as e:
             logger.error(f"Error processing audio message: {e}")
-            return None
+            import traceback
+            logger.error(traceback.format_exc())
+            return None, None
     
     def process_single_message(self, message_data):
         """Process one message based on its type"""
         message_id = message_data.get('id')
-        media_type = message_data.get('media_type', 'text')
-        user_id = message_data.get('user_id', 'unknown')
+        conversation_id = message_data.get('conversation_id')
         
-        logger.info(f"Processing message {message_id} (user: {user_id}, type: {media_type})")
+        # Get the type field
+        media_type_raw = message_data.get('type', '')
+        logger.info(f"\n{'='*60}")
+        logger.info(f"📨 MESSAGE ID: {message_id}")
+        logger.info(f"📋 RAW TYPE: '{media_type_raw}'")
+        logger.info(f"📋 CONVERSATION ID: {conversation_id}")
         
-        try:
-            # Route to appropriate handler
-            if media_type == 'text':
-                result = self.process_text_message(message_data)
-            elif media_type == 'image':
-                result = self.process_image_message(message_data)
-            elif media_type == 'audio':
-                result = self.process_audio_message(message_data)
-            else:
-                logger.error(f"Unknown media type: {media_type}")
-                self.error_count += 1
-                return False
+        # 🔧 Variables to store results
+        result = None
+        extracted_text = None
+        
+        # Check if it's an image
+        if media_type_raw == 'image':
+            logger.info("✅ THIS IS AN IMAGE MESSAGE!")
+            result, extracted_text = self.process_image_message(message_data)  # 🔧 Get both
             
-            if result:
-                # Update Firebase with the result
-                success = self.firebase.update_message_status(message_id, result)
-                
-                if success:
-                    self.processed_count += 1
-                    logger.info(f"✅ Message {message_id} marked as {result}")
-                    return True
-                else:
-                    logger.error(f"Failed to update Firebase for {message_id}")
-                    self.error_count += 1
-                    return False
+        # Check if it's voice/audio
+        elif media_type_raw == 'voice':
+            logger.info("✅ THIS IS A VOICE MESSAGE!")
+            result, extracted_text = self.process_audio_message(message_data)  # 🔧 Get both
+            
+        # Check if it's text
+        elif media_type_raw == 'text':
+            logger.info("✅ THIS IS A TEXT MESSAGE!")
+            result, extracted_text = self.process_text_message(message_data)  # 🔧 Get both
+            
+        else:
+            logger.warning(f"⚠️ UNKNOWN MESSAGE TYPE: {media_type_raw}")
+            logger.info(f"Available fields: {list(message_data.keys())}")
+            self.error_count += 1
+            return False
+        
+        # Update Firebase with result AND extracted text
+        if result:
+            logger.info(f"✅ Spam detection result: {result}")
+            if extracted_text:
+                logger.info(f"📝 Extracted text will be saved: {extracted_text[:100]}...")
+            
+            # 🔧 Pass extracted_text to Firebase
+            success = self.firebase.update_message_status(
+                conversation_id=conversation_id,
+                message_id=message_id,
+                spam_status=result,
+                confidence=0.95,
+                extracted_text=extracted_text  # 🔧 This is the key change!
+            )
+            
+            if success:
+                self.processed_count += 1
+                logger.info(f"✅✅ Message {message_id} successfully processed!")
+                if extracted_text:
+                    logger.info(f"   📝 Extracted text saved to Firebase ✓")
+                return True
             else:
-                logger.warning(f"Could not extract/predict for {message_id}")
+                logger.error(f"Failed to update Firebase for {message_id}")
                 self.error_count += 1
                 return False
-                
-        except Exception as e:
-            logger.error(f"Unexpected error processing {message_id}: {e}")
+        else:
+            logger.warning(f"Could not process message {message_id}")
             self.error_count += 1
             return False
     
     def process_batch(self, batch_size=5):
         """Process a batch of unprocessed messages"""
         self.last_run_time = datetime.now()
-        logger.info(f"Checking for new messages (batch size: {batch_size})")
+        logger.info(f"\n🔍 Checking for new messages...")
         
         try:
-            # Get unprocessed messages
             messages = self.firebase.get_unprocessed_messages(limit=batch_size)
             
             if not messages:
                 logger.debug("No new messages to process")
                 return 0
             
-            logger.info(f"Found {len(messages)} new messages")
+            logger.info(f"📊 Found {len(messages)} new message(s)")
             
-            # Process each message
+            # Log each message's type
+            for i, msg in enumerate(messages, 1):
+                logger.info(f"  Message {i}: ID={msg.get('id')}, Type={msg.get('type')}")
+            
             processed = 0
             for msg in messages:
                 if self.process_single_message(msg):
                     processed += 1
             
-            logger.info(f"Batch complete: {processed}/{len(messages)} processed successfully")
+            logger.info(f"📊 Batch complete: {processed}/{len(messages)} processed")
             return processed
             
         except Exception as e:
             logger.error(f"Error in process_batch: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
             return 0
     
     def start_continuous_processing(self, interval=10, batch_size=5):
@@ -225,13 +282,9 @@ class MessageProcessor:
                 except Exception as e:
                     logger.error(f"Error in processing loop: {e}")
                     self.error_count += 1
-                
-                # Wait before next check
                 time.sleep(interval)
-            
             logger.info("Processor thread stopped")
         
-        # Start in background thread
         thread = threading.Thread(target=run, daemon=True)
         thread.start()
         return thread
